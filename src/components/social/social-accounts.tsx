@@ -1,0 +1,392 @@
+import { useState, type ReactNode } from "react"
+import { Link, useSearch } from "@tanstack/react-router"
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import { CircleNotch } from "@phosphor-icons/react"
+import { superclerk } from "@/api/client"
+import type { SocialAccount } from "@/api/social"
+import { Button, BusyButton, buttonClass } from "@/components/common/button"
+import { ErrorState, LoadingState } from "@/components/common/empty-state"
+import { ConfirmDialog, FormError } from "@/components/common/form-dialog"
+import { PageBody, PageHeader } from "@/components/common/page"
+import { PANEL } from "@/components/common/section"
+import { Switch } from "@/components/common/switch"
+import { errorMessage } from "@/lib/errors"
+import {
+  connectionAccounts,
+  listSocialConnections,
+  SocialNetworks,
+  SocialPlatformLabels,
+  type SocialConnection,
+} from "@/lib/social"
+import { cn } from "@/lib/utils"
+import { ClientLogo } from "./social-assistants"
+import { PlatformLogo } from "./social-logo"
+
+export const socialAccountsKey = ["social", "accounts"] as const
+
+/** Sends the person to the network's own sign-in, and back to this page. */
+function useConnect() {
+  return useMutation({
+    mutationFn: (target: { appID: string } | { connectionID: string }) =>
+      superclerk.connect.links.create({
+        ...target,
+        headless: true,
+        returnURL: new URL("/?view=accounts", window.location.origin).href,
+      }),
+    onSuccess: (link) => window.location.assign(link.url),
+  })
+}
+
+function Reconnect({ connectionID }: { connectionID: string | null }) {
+  const connect = useConnect()
+  if (connectionID === null) return null
+  return (
+    <button
+      type="button"
+      disabled={connect.isPending}
+      onClick={() => connect.mutate({ connectionID })}
+      className="cursor-pointer font-medium text-foreground underline decoration-foreground/25 underline-offset-2"
+    >
+      Reconnect
+    </button>
+  )
+}
+
+/** Every network this app posts to, one click from its own sign-in. */
+function ConnectNetworks() {
+  const connect = useConnect()
+  const starting =
+    connect.isPending && connect.variables !== undefined && "appID" in connect.variables
+      ? connect.variables.appID
+      : null
+  return (
+    <>
+      <div role="group" aria-label="Connect a platform" className="grid grid-cols-2 gap-1.5 sm:grid-cols-4">
+        {SocialNetworks.map((network) => (
+          <button
+            key={network.appID}
+            type="button"
+            disabled={connect.isPending}
+            onClick={() => connect.mutate({ appID: network.appID })}
+            className="flex min-w-0 cursor-pointer items-center gap-2.5 rounded-xl bg-surface-soft px-3 py-2.5 text-left transition-colors hover:bg-surface-medium focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-not-allowed"
+          >
+            <PlatformLogo platform={network.platform} size={24} />
+            <span className="min-w-0 flex-1 text-[13px] font-medium leading-tight text-foreground">{network.label}</span>
+            {starting === network.appID && (
+              <CircleNotch size={14} className="shrink-0 animate-spin text-muted-foreground" />
+            )}
+          </button>
+        ))}
+      </div>
+      {connect.error && <FormError>{errorMessage(connect.error, "Could not start connecting")}</FormError>}
+    </>
+  )
+}
+
+// A network that shares only what the person ticks in its own window says where to tick it.
+const SHARE_HELP: Partial<Record<SocialAccount["platform"], ReactNode>> = {
+  facebook: (
+    <>
+      Reconnect, click “Edit access” in Facebook’s window and tick your Page, or{" "}
+      <a
+        href="https://www.facebook.com/settings/?tab=business_tools"
+        target="_blank"
+        rel="noreferrer"
+        className="font-medium text-brand hover:underline"
+      >
+        choose its Pages in Facebook’s settings
+      </a>
+      .
+    </>
+  ),
+}
+
+/** Where an account sits, and whether its connection still lets posts through. */
+function Where({ where, account }: { where: string; account: SocialAccount | undefined }) {
+  if (account?.status !== "disconnected") return where
+  return (
+    <>
+      {where} · <span className="text-destructive">Disconnected</span> ·{" "}
+      <Reconnect connectionID={account.connectionID} />
+    </>
+  )
+}
+
+function Row({ platform, children }: { platform: SocialAccount["platform"]; children: ReactNode }) {
+  return (
+    <div className="flex min-h-14 items-center gap-3 px-4 py-2.5">
+      <PlatformLogo platform={platform} size={32} />
+      {children}
+    </div>
+  )
+}
+
+/**
+ * One place posts can go, switched on while the workspace publishes there. `add` is how it is switched on;
+ * it is null once the connection stops offering the account, which can then only be switched off.
+ */
+function AccountRow({
+  platform,
+  label,
+  where,
+  account,
+  add,
+}: {
+  platform: SocialAccount["platform"]
+  label: string
+  where: ReactNode
+  account: SocialAccount | undefined
+  add: { connectionID: string; providerAccountID: string } | null
+}) {
+  const cache = useQueryClient()
+  const [removing, setRemoving] = useState(false)
+  const connect = useMutation({
+    mutationFn: ({ connectionID, providerAccountID }: { connectionID: string; providerAccountID: string }) =>
+      superclerk.connections.accounts.add(connectionID, { providerAccountID }, { idempotencyKey: crypto.randomUUID() }),
+    onSuccess: () => cache.invalidateQueries({ queryKey: socialAccountsKey }),
+  })
+  const remove = useMutation({
+    mutationFn: (accountId: string) => superclerk.social.accounts.disconnect(accountId),
+    onSuccess: async () => {
+      await cache.invalidateQueries({ queryKey: socialAccountsKey })
+      setRemoving(false)
+    },
+  })
+  const name = `${label} on ${SocialPlatformLabels[platform]}`
+  return (
+    <Row platform={platform}>
+      <div className="min-w-0 flex-1">
+        <p className="truncate text-[13px] font-medium text-foreground">{label}</p>
+        <p className="truncate text-xs text-muted-foreground">{connect.isPending ? "Adding…" : where}</p>
+        {connect.error && <FormError>{errorMessage(connect.error, "The account could not be added")}</FormError>}
+      </div>
+      <label className="flex shrink-0 cursor-pointer has-[:disabled]:cursor-not-allowed has-[:disabled]:opacity-60">
+        <span className="sr-only">Post to {name}</span>
+        <Switch
+          checked={account !== undefined || connect.isPending}
+          disabled={connect.isPending || (account === undefined && add === null)}
+          onChange={(next) => {
+            if (!next) return setRemoving(true)
+            if (add === null) throw new Error("This account is no longer offered by its connection")
+            connect.mutate(add)
+          }}
+        />
+      </label>
+      {account !== undefined && (
+        <ConfirmDialog
+          open={removing}
+          title={`Stop posting to ${label}?`}
+          description="Posts waiting to go to this account won’t publish there. Nothing already published is deleted, and you can switch it back on later."
+          confirmLabel="Stop posting"
+          pending={remove.isPending}
+          onConfirm={() => remove.mutate(account.id)}
+          onOpenChange={(open) => {
+            if (!open) {
+              setRemoving(false)
+              remove.reset()
+            }
+          }}
+        >
+          {remove.error && <FormError>{errorMessage(remove.error, "The account could not be removed")}</FormError>}
+        </ConfirmDialog>
+      )}
+    </Row>
+  )
+}
+
+/**
+ * Every account one connection can publish to, found as soon as the page opens. Saved accounts show
+ * straight away; the connection's answer adds the ones not switched on yet.
+ */
+function ConnectionAccounts({
+  connection,
+  saved,
+  named,
+}: {
+  connection: SocialConnection
+  /** This connection's accounts the workspace publishes to. */
+  saved: SocialAccount[]
+  /** Whether the platform has several connections, so this one is told apart by its name. */
+  named: boolean
+}) {
+  const offered = useQuery({
+    queryKey: ["social", "discovery", connection.id],
+    queryFn: () => connectionAccounts(connection.id),
+    staleTime: 5 * 60_000,
+    refetchOnWindowFocus: false,
+    retry: false,
+  })
+  const reconnect = useConnect()
+  const platform = SocialPlatformLabels[connection.platform]
+  const where = named ? `${platform} · ${connection.label}` : platform
+  const candidates = offered.data
+  const unlisted =
+    candidates === undefined
+      ? saved
+      : saved.filter((account) => !candidates.some((candidate) => candidate.providerAccountID === account.nativeId))
+  return (
+    <>
+      {candidates?.map((candidate) => {
+        const account = saved.find((item) => item.nativeId === candidate.providerAccountID)
+        return (
+          <AccountRow
+            key={candidate.providerAccountID}
+            platform={connection.platform}
+            label={candidate.label}
+            where={<Where where={where} account={account} />}
+            account={account}
+            add={{ connectionID: connection.id, providerAccountID: candidate.providerAccountID }}
+          />
+        )
+      })}
+      {unlisted.map((account) => (
+        <AccountRow
+          key={account.id}
+          platform={account.platform}
+          label={account.label}
+          where={
+            candidates === undefined ? (
+              <Where where={where} account={account} />
+            ) : (
+              `${where} · No longer available on this connection`
+            )
+          }
+          account={account}
+          add={null}
+        />
+      ))}
+      {offered.isPending && saved.length === 0 && (
+        <Row platform={connection.platform}>
+          <p className="min-w-0 flex-1 truncate text-xs text-muted-foreground">Finding your {platform} accounts…</p>
+          <CircleNotch size={14} className="shrink-0 animate-spin text-muted-foreground" />
+        </Row>
+      )}
+      {offered.isError && (
+        <Row platform={connection.platform}>
+          <p className="min-w-0 flex-1 text-xs text-destructive">
+            {errorMessage(offered.error, `Couldn’t load your ${platform} accounts`)}
+          </p>
+          <Button type="button" variant="ghost" size="sm" onClick={() => void offered.refetch()}>
+            Retry
+          </Button>
+        </Row>
+      )}
+      {candidates?.length === 0 && saved.length === 0 && (
+        <Row platform={connection.platform}>
+          <div className="min-w-0 flex-1 text-xs text-muted-foreground">
+            {where} didn’t share an account with Postclerk. {SHARE_HELP[connection.platform]}
+            {reconnect.error && <FormError>{errorMessage(reconnect.error, "Could not start reconnecting")}</FormError>}
+          </div>
+          <BusyButton
+            type="button"
+            variant="secondary"
+            size="sm"
+            pending={reconnect.isPending}
+            onClick={() => reconnect.mutate({ connectionID: connection.id })}
+          >
+            Reconnect
+          </BusyButton>
+        </Row>
+      )}
+    </>
+  )
+}
+
+/**
+ * Where posts can go: every account the workspace's connected platforms offer, each switched on or off in
+ * place. Beyond a sign-in's only account, nothing is switched on for the person.
+ */
+export function AccountsView({ accounts }: { accounts: SocialAccount[] }) {
+  const failed = useSearch({ from: "/" }).connect_error
+  const connections = useQuery({ queryKey: ["social", "connections"], queryFn: listSocialConnections })
+  if (connections.data === undefined)
+    return connections.error ? (
+      <ErrorState
+        message={errorMessage(connections.error, "Could not load connected platforms")}
+        onRetry={connections.refetch}
+      />
+    ) : (
+      <LoadingState message="Loading connected platforms…" />
+    )
+  const linked = connections.data
+  const saved = accounts.filter((account) => account.status !== "disabled")
+  const owns = (connection: SocialConnection, account: SocialAccount) =>
+    account.platform === connection.platform && account.connectionID === connection.id
+  const orphaned = saved.filter((account) => !linked.some((connection) => owns(connection, account)))
+  const listed = linked.length > 0 || orphaned.length > 0
+  return (
+    <div className="min-w-0 max-w-3xl space-y-3">
+      {failed !== undefined && <FormError>That account didn’t connect ({failed}). Try again.</FormError>}
+      {listed && (
+        <div className={cn(PANEL, "divide-y divide-border/50")}>
+          {linked.map((connection) => (
+            <ConnectionAccounts
+              key={connection.id}
+              connection={connection}
+              saved={saved.filter((account) => owns(connection, account))}
+              named={linked.filter((item) => item.platform === connection.platform).length > 1}
+            />
+          ))}
+          {orphaned.map((account) => (
+            <AccountRow
+              key={account.id}
+              platform={account.platform}
+              label={account.label}
+              where={
+                <>
+                  {SocialPlatformLabels[account.platform]} · <span className="text-destructive">Disconnected</span> ·{" "}
+                  <Reconnect connectionID={account.connectionID} />
+                </>
+              }
+              account={account}
+              add={null}
+            />
+          ))}
+        </div>
+      )}
+      {listed && <h2 className="px-1 pt-5 text-xs font-medium text-muted-foreground">Connect another platform</h2>}
+      <ConnectNetworks />
+    </div>
+  )
+}
+
+/**
+ * Where a workspace with nowhere to post opens, whichever page it asked for: the networks to connect, the accounts its
+ * connections already offer, and the AI assistants that can post here too.
+ */
+export function FirstSteps({ accounts }: { accounts: SocialAccount[] }) {
+  return (
+    <>
+      <PageHeader
+        title="Connect where you post"
+        description="Pick a network and sign in to it. Postclerk posts to the accounts you switch on."
+      />
+      <PageBody>
+        <AccountsView accounts={accounts} />
+        <section
+          aria-label="AI assistants"
+          className="mt-10 flex max-w-3xl flex-col gap-3 rounded-2xl bg-surface-soft p-4 sm:flex-row sm:items-center sm:gap-4"
+        >
+          <div className="flex shrink-0 gap-1.5">
+            <ClientLogo src="/logos/claudecode.svg" />
+            <ClientLogo src="/logos/codex.svg" />
+            <ClientLogo src="/logos/cursor.svg" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <p className="text-[13px] font-medium text-foreground">Work from your AI assistant</p>
+            <p className="text-xs text-muted-foreground">
+              Claude Code, Codex, Cursor and others can write and schedule posts here, through Postclerk’s MCP server.
+            </p>
+          </div>
+          <Link
+            to="/"
+            search={{ view: "assistants" }}
+            className={cn(buttonClass("secondary", "sm"), "self-start sm:self-auto")}
+          >
+            Set up an assistant
+          </Link>
+        </section>
+      </PageBody>
+    </>
+  )
+}
